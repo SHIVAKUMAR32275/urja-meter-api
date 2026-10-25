@@ -6,9 +6,14 @@ import com.urja.urja_meter_api.client.PortalClient;
 import com.urja.urja_meter_api.dto.MeterPageResponse;
 import com.urja.urja_meter_api.service.MeterService;
 import jakarta.validation.constraints.Min;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
 
+import java.net.http.HttpResponse;
 import java.util.Map;
 
 @RestController
@@ -59,4 +64,40 @@ public class ApiController {
 
         return meterService.getMeterEnergy(meterId);
     }
+
+    @GetMapping("/meters/{meterId}/geo")
+    public JsonNode getMeterGeo(
+            @PathVariable String meterId) {
+
+        return portalClient.getMeterGeo(meterId);
+    }
+
+
+    @GetMapping("/export")
+    public ResponseEntity<byte[]> export(
+            @RequestParam(defaultValue = "1")
+            @Min(value = 1, message = "Page must be at least 1")
+            int page) {
+
+        HttpResponse<byte[]> upstream = portalClient.getExport(page);
+
+        HttpHeaders headers = new HttpHeaders();
+
+        upstream.headers()
+                .firstValue("Content-Type")
+                .ifPresent(value ->
+                        headers.set(HttpHeaders.CONTENT_TYPE, value));
+
+        upstream.headers()
+                .firstValue("Content-Disposition")
+                .ifPresent(value ->
+                        headers.set(HttpHeaders.CONTENT_DISPOSITION, value));
+
+        return new ResponseEntity<>(
+                upstream.body(),
+                headers,
+                HttpStatus.OK
+        );
+    }
+
 }

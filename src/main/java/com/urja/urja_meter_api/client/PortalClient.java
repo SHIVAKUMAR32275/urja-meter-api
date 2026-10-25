@@ -4,10 +4,6 @@ package com.urja.urja_meter_api.client;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.urja.urja_meter_api.dto.MeterPageResponse;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpStatus;
-import org.springframework.stereotype.Component;
-import org.springframework.web.server.ResponseStatusException;
 
 import java.io.IOException;
 import java.net.CookieManager;
@@ -18,7 +14,18 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.HexFormat;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Component;
+import org.springframework.web.server.ResponseStatusException;
 
 @Component
 public class PortalClient {
@@ -27,63 +34,57 @@ public class PortalClient {
     private final String username;
     private final String password;
     private final ObjectMapper objectMapper;
-    private final HttpClient httpClient;
+    private final CookieManager cookieManager;
+    private final HttpClient client;
 
-    private volatile boolean authenticated;
+    private volatile boolean authenticated = false;
 
     public PortalClient(
             @Value("${urja.portal.base-url}") String baseUrl,
             @Value("${urja.portal.username}") String username,
-            @Value("${urja.portal.password:}") String password,
-            ObjectMapper objectMapper) {
-
+            @Value("${urja.portal.password}") String password,
+            ObjectMapper objectMapper
+    ) {
         this.baseUrl = baseUrl.replaceAll("/+$", "");
         this.username = username;
         this.password = password;
         this.objectMapper = objectMapper;
 
-        CookieManager cookieManager = new CookieManager();
-        cookieManager.setCookiePolicy(CookiePolicy.ACCEPT_ALL);
+        this.cookieManager = new CookieManager();
+        this.cookieManager.setCookiePolicy(CookiePolicy.ACCEPT_ALL);
 
-        this.httpClient = HttpClient.newBuilder()
+        this.client = HttpClient.newBuilder()
                 .cookieHandler(cookieManager)
-                .followRedirects(HttpClient.Redirect.NORMAL)
                 .connectTimeout(Duration.ofSeconds(10))
+                .followRedirects(HttpClient.Redirect.NORMAL)
                 .build();
     }
 
+    public boolean isAuthenticated() {
+        return authenticated;
+    }
+
     public synchronized void authenticate() {
-        if (password == null || password.isBlank()) {
-            throw new ResponseStatusException(
-                    HttpStatus.SERVICE_UNAVAILABLE,
-                    "Portal password is not configured."
-            );
-        }
-
-        authenticated = false;
-
         try {
             HttpRequest loginPageRequest = HttpRequest.newBuilder()
-                    .uri(uri("/login"))
+                    .uri(URI.create(baseUrl + "/login"))
                     .timeout(Duration.ofSeconds(15))
                     .header("Accept", "text/html")
                     .GET()
                     .build();
 
-            HttpResponse<String> loginPage = send(loginPageRequest);
+            client.send(
+                    loginPageRequest,
+                    HttpResponse.BodyHandlers.ofString(
+                            StandardCharsets.UTF_8
+                    )
+            );
 
-            if (loginPage.statusCode() != 200) {
-                throw upstreamError(
-                        "Unable to load the portal login page. HTTP "
-                                + loginPage.statusCode()
-                );
-            }
-
-            String form = "email=" + encode(username)
+            String formBody = "email=" + encode(username)
                     + "&password=" + encode(password);
 
             HttpRequest loginRequest = HttpRequest.newBuilder()
-                    .uri(uri("/login"))
+                    .uri(URI.create(baseUrl + "/login"))
                     .timeout(Duration.ofSeconds(15))
                     .header(
                             "Content-Type",
@@ -93,78 +94,91 @@ public class PortalClient {
                     .header("Origin", baseUrl)
                     .header("Referer", baseUrl + "/login")
                     .header("x-sveltekit-action", "true")
-                    .POST(HttpRequest.BodyPublishers.ofString(form))
+                    .POST(HttpRequest.BodyPublishers.ofString(formBody))
                     .build();
 
-            HttpResponse<String> response = send(loginRequest);
+            HttpResponse<String> loginResponse = client.send(
+                    loginRequest,
+                    HttpResponse.BodyHandlers.ofString(
+                            StandardCharsets.UTF_8
+                    )
+            );
 
-            boolean redirectInstructionFound = false;
-            String redirectLocation = "";
+            if (loginResponse.statusCode() < 200
+                    || loginResponse.statusCode() >= 300) {
+                authenticated = false;
 
-            if (response.body() != null
-                    && !response.body().isBlank()) {
-                try {
-                    JsonNode json = objectMapper.readTree(response.body());
-
-                    redirectLocation = json.path("location").asText("");
-
-                    redirectInstructionFound =
-                            response.statusCode() == 200
-                                    && "redirect".equals(
-                                    json.path("type").asText()
-                            )
-                                    && json.path("status").asInt() >= 300
-                                    && json.path("status").asInt() < 400
-                                    && !redirectLocation.isBlank()
-                                    && redirectLocation.startsWith("/")
-                                    && !redirectLocation.startsWith("//");
-                } catch (Exception ignored) {
-                    redirectInstructionFound = false;
-                }
-            }
-
-            if (response.statusCode() >= 400
-                    || !redirectInstructionFound) {
-
-                System.err.println(
-                        "Portal login HTTP status: "
-                                + response.statusCode()
-                );
-
-                System.err.println(
-                        "Portal login response: "
-                                + sanitizeResponse(response.body())
-                );
-
-                throw upstreamError(
-                        "Portal login failed. Check the credentials and "
-                                + "the sanitized application diagnostics."
+                throw new ResponseStatusException(
+                        HttpStatus.BAD_GATEWAY,
+                        "Portal login failed with HTTP status "
+                                + loginResponse.statusCode()
                 );
             }
 
-            authenticated = true;
+            JsonNode json;
 
-            System.out.println(
-                    "Portal login returned redirect instruction: "
-                            + redirectLocation
+            try {
+                json = objectMapper.readTree(loginResponse.body());
+            } catch (Exception e) {
+                authenticated = false;
+
+                throw new ResponseStatusException(
+                        HttpStatus.BAD_GATEWAY,
+                        "Portal login returned an unexpected response."
+                );
+            }
+
+            String type = json.path("type").asText("");
+            int status = json.path("status").asInt(0);
+
+            if ("redirect".equals(type)
+                    && status >= 300
+                    && status < 400) {
+                authenticated = true;
+                return;
+            }
+
+            authenticated = false;
+
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_GATEWAY,
+                    "Portal login was not confirmed by the portal."
+            );
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            authenticated = false;
+
+            throw new ResponseStatusException(
+                    HttpStatus.SERVICE_UNAVAILABLE,
+                    "Portal login was interrupted."
             );
 
         } catch (IOException e) {
             authenticated = false;
-            throw upstreamError("Could not connect to the portal.");
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            authenticated = false;
-            throw upstreamError("Portal login was interrupted.");
+
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_GATEWAY,
+                    "Unable to communicate with the portal login endpoint."
+            );
         }
     }
 
     public MeterPageResponse getMeters(String query, int page) {
-        String path = "/portal/meters/search?q="
-                + encode(query == null ? "" : query)
-                + "&page=" + page;
+        if (page < 1) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "Page must be greater than or equal to 1."
+            );
+        }
 
-        JsonNode json = getJson(path);
+        String safeQuery = query == null ? "" : query;
+
+        JsonNode json = getJson(
+                "/portal/meters/search?q="
+                        + encode(safeQuery)
+                        + "&page=" + page
+        );
 
         try {
             return objectMapper.treeToValue(
@@ -172,117 +186,224 @@ public class PortalClient {
                     MeterPageResponse.class
             );
         } catch (Exception e) {
-            throw upstreamError(
-                    "The portal returned an unexpected meter-list response."
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_GATEWAY,
+                    "Unable to parse the meter list response."
             );
         }
     }
 
     public JsonNode getMeterDetails(String meterId) {
-        MeterPageResponse response = getMeters(meterId, 1);
+        validateMeterId(meterId);
 
-        if (response.data() == null) {
-            throw new ResponseStatusException(
-                    HttpStatus.BAD_GATEWAY,
-                    "The portal returned an invalid meter-list response."
-            );
-        }
-
-        return response.data()
-                .stream()
-                .filter(meter -> meterId.equals(meter.meterId()))
-                .findFirst()
-                .map(meter ->
-                        objectMapper.<JsonNode>valueToTree(meter)
-                )
-                .orElseThrow(() -> new ResponseStatusException(
-                        HttpStatus.NOT_FOUND,
-                        "Meter not found: " + meterId
-                ));
-    }
-
-    public JsonNode getMeterEnergy(String meterId) {
-        return getJson(
-                "/portal/meters/" + encode(meterId) + "/energy"
+        JsonNode response = getJson(
+                "/portal/meters/search?q="
+                        + encode(meterId)
+                        + "&page=1"
         );
-    }
 
-    private JsonNode getJson(String path) {
-        for (int attempt = 0; attempt < 2; attempt++) {
-            if (!authenticated) {
-                authenticate();
-            }
+        JsonNode data = response.path("data");
 
-            try {
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(uri(path))
-                        .timeout(Duration.ofSeconds(15))
-                        .header("Accept", "application/json")
-                        .GET()
-                        .build();
-
-                HttpResponse<String> response = send(request);
-
-                if (response.statusCode() == 401
-                        || response.uri().getPath().equals("/login")) {
-                    authenticated = false;
-                    continue;
+        if (data.isArray()) {
+            for (JsonNode meter : data) {
+                if (meterId.equals(meter.path("meterId").asText())) {
+                    return meter;
                 }
-
-                if (response.statusCode() == 404) {
-                    throw new ResponseStatusException(
-                            HttpStatus.NOT_FOUND,
-                            "The requested portal resource was not found."
-                    );
-                }
-
-                if (response.statusCode() != 200) {
-                    System.err.println(
-                            "Portal data HTTP status: "
-                                    + response.statusCode()
-                    );
-
-                    System.err.println(
-                            "Portal data response: "
-                                    + sanitizeResponse(response.body())
-                    );
-
-                    throw upstreamError(
-                            "The portal request failed with HTTP "
-                                    + response.statusCode() + "."
-                    );
-                }
-
-                try {
-                    return objectMapper.readTree(response.body());
-                } catch (Exception e) {
-                    throw upstreamError(
-                            "The portal returned invalid JSON."
-                    );
-                }
-
-            } catch (IOException e) {
-                throw upstreamError(
-                        "Could not retrieve data from the portal."
-                );
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw upstreamError(
-                        "The portal request was interrupted."
-                );
             }
         }
 
         throw new ResponseStatusException(
-                HttpStatus.BAD_GATEWAY,
-                "Portal authentication failed or the session expired."
+                HttpStatus.NOT_FOUND,
+                "Meter not found: " + meterId
         );
     }
 
-    private HttpResponse<String> send(HttpRequest request)
+    public JsonNode getMeterEnergy(String meterId) {
+        validateMeterId(meterId);
+
+        return getJson(
+                "/portal/meters/" + meterId + "/energy"
+        );
+    }
+
+    public JsonNode getMeterGeo(String meterId) {
+        validateMeterId(meterId);
+
+        return getJson(
+                "/portal/meters/" + meterId + "/geo"
+        );
+    }
+
+    public HttpResponse<byte[]> getExport(int page) {
+        if (page < 1) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "Page must be greater than or equal to 1."
+            );
+        }
+
+        try {
+            if (!authenticated) {
+                authenticate();
+            }
+
+            // Fetch the signing secret from the portal for this session.
+            JsonNode keysResponse = getJson("/portal/keys");
+
+            String signingSecret = keysResponse
+                    .path("data")
+                    .path("signingSecret")
+                    .asText("");
+
+            if (signingSecret.isBlank()) {
+                throw new ResponseStatusException(
+                        HttpStatus.BAD_GATEWAY,
+                        "Portal did not provide a signing secret."
+                );
+            }
+
+            String path = "/portal/export";
+            String query = "page=" + page;
+            String timestamp = String.valueOf(
+                    Instant.now().getEpochSecond()
+            );
+
+            String signature = generateSignature(
+                    "GET",
+                    path,
+                    query,
+                    timestamp,
+                    signingSecret
+            );
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(
+                            baseUrl + path + "?" + query
+                    ))
+                    .timeout(Duration.ofSeconds(30))
+                    .header("Accept", "*/*")
+                    .header("Referer", baseUrl + "/transformers")
+                    .header("x-timestamp", timestamp)
+                    .header("x-signature", signature)
+                    .GET()
+                    .build();
+
+            HttpResponse<byte[]> response = client.send(
+                    request,
+                    HttpResponse.BodyHandlers.ofByteArray()
+            );
+
+            if (response.statusCode() < 200
+                    || response.statusCode() >= 300) {
+                String body = new String(
+                        response.body(),
+                        StandardCharsets.UTF_8
+                );
+
+                System.err.println(
+                        "Export failed with HTTP status "
+                                + response.statusCode()
+                                + ": " + sanitizeResponse(body)
+                );
+
+                if (response.statusCode() == 401
+                        || response.statusCode() == 403) {
+                    authenticated = false;
+                }
+
+                throw new ResponseStatusException(
+                        HttpStatus.BAD_GATEWAY,
+                        "Portal export failed with HTTP status "
+                                + response.statusCode()
+                );
+            }
+
+            return response;
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+
+            throw new ResponseStatusException(
+                    HttpStatus.SERVICE_UNAVAILABLE,
+                    "Export request was interrupted."
+            );
+
+        } catch (IOException e) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_GATEWAY,
+                    "Unable to communicate with the portal export endpoint."
+            );
+
+        } catch (GeneralSecurityException e) {
+            throw new ResponseStatusException(
+                    HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Unable to generate the export request signature."
+            );
+        }
+    }
+
+    private JsonNode getJson(String path) {
+        try {
+            if (!authenticated) {
+                authenticate();
+            }
+
+            HttpResponse<String> response = sendJsonRequest(path);
+
+            if (response.statusCode() == 401
+                    || response.statusCode() == 403
+                    || response.uri().getPath().equals("/login")) {
+                authenticated = false;
+                authenticate();
+                response = sendJsonRequest(path);
+            }
+
+            if (response.statusCode() == 404) {
+                throw new ResponseStatusException(
+                        HttpStatus.NOT_FOUND,
+                        "Requested portal resource was not found."
+                );
+            }
+
+            if (response.statusCode() < 200
+                    || response.statusCode() >= 300) {
+                throw new ResponseStatusException(
+                        HttpStatus.BAD_GATEWAY,
+                        "Portal request failed with HTTP status "
+                                + response.statusCode()
+                );
+            }
+
+            return objectMapper.readTree(response.body());
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+
+            throw new ResponseStatusException(
+                    HttpStatus.SERVICE_UNAVAILABLE,
+                    "Portal request was interrupted."
+            );
+
+        } catch (IOException e) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_GATEWAY,
+                    "Unable to read the portal response."
+            );
+        }
+    }
+
+    private HttpResponse<String> sendJsonRequest(String path)
             throws IOException, InterruptedException {
 
-        return httpClient.send(
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + path))
+                .timeout(Duration.ofSeconds(20))
+                .header("Accept", "application/json")
+                .header("Referer", baseUrl + "/transformers")
+                .GET()
+                .build();
+
+        return client.send(
                 request,
                 HttpResponse.BodyHandlers.ofString(
                         StandardCharsets.UTF_8
@@ -290,8 +411,36 @@ public class PortalClient {
         );
     }
 
-    private URI uri(String path) {
-        return URI.create(baseUrl + path);
+    private String generateSignature(
+            String method,
+            String path,
+            String query,
+            String timestamp,
+            String signingSecret
+    ) throws GeneralSecurityException {
+
+        String message = String.join(
+                "\n",
+                method,
+                path,
+                query,
+                timestamp
+        );
+
+        Mac mac = Mac.getInstance("HmacSHA256");
+
+        SecretKeySpec key = new SecretKeySpec(
+                signingSecret.getBytes(StandardCharsets.UTF_8),
+                "HmacSHA256"
+        );
+
+        mac.init(key);
+
+        byte[] signature = mac.doFinal(
+                message.getBytes(StandardCharsets.UTF_8)
+        );
+
+        return HexFormat.of().formatHex(signature);
     }
 
     private String encode(String value) {
@@ -301,31 +450,33 @@ public class PortalClient {
         );
     }
 
+    private void validateMeterId(String meterId) {
+        if (meterId == null
+                || !meterId.matches("[A-Za-z0-9_-]+")) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "Invalid meter ID."
+            );
+        }
+    }
+
     private String sanitizeResponse(String body) {
-        if (body == null) {
-            return "";
+        if (body == null || body.isBlank()) {
+            return "(empty response)";
         }
 
-        return body
+        String sanitized = body
                 .replaceAll(
-                        "(?i)(\"password\"\\s*:\\s*\")[^\"]*(\")",
-                        "$1[REDACTED]$2"
+                        "(?i)(password|token|cookie|authorization|signingSecret)"
+                                + "\\s*[\"']?\\s*[:=]\\s*[\"']?"
+                                + "[^\"',}\\s]+",
+                        "$1=[REDACTED]"
                 )
-                .replaceAll(
-                        "(?i)(\"(?:token|session_token|access_token|"
-                                + "refresh_token|cookie)\"\\s*:\\s*\")[^\"]*(\")",
-                        "$1[REDACTED]$2"
-                );
-    }
+                .replaceAll("[\\r\\n\\t]+", " ");
 
-    private ResponseStatusException upstreamError(String message) {
-        return new ResponseStatusException(
-                HttpStatus.BAD_GATEWAY,
-                message
+        return sanitized.substring(
+                0,
+                Math.min(sanitized.length(), 500)
         );
-    }
-
-    public boolean isAuthenticated() {
-        return authenticated;
     }
 }
